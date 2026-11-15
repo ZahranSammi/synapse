@@ -11,6 +11,11 @@ use crate::platform::paths;
 
 const BUILTIN_NODE_MODULES: &[&str] = &["npm", "corepack"];
 const BUILTIN_NODE_BINS: &[&str] = &["node", "npm", "npx", "corepack"];
+const RESERVED_RUNTIME_BINS: &[&str] = &[
+    "synapse", "node", "npm", "npx", "corepack", "bun", "bunx",
+    "php", "composer", "postgres", "psql", "pg_ctl", "initdb",
+    "pg_dump", "createdb", "dropdb", "nginx",
+];
 
 /// Validates that a package name is safe to store in a manifest and pass to a package manager.
 pub fn is_valid_package_name(name: &str) -> bool {
@@ -173,8 +178,54 @@ pub fn discover_installed_globals(runtime: &str, version: &str) -> Result<Vec<St
     }
 }
 
+/// Removes broken global Node package symlinks/shims in `bin_dir` pointing to `../current/node/`.
+pub fn cleanup_stale_node_global_bins(bin_dir: &Path) -> Result<Vec<String>> {
+    if !bin_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut removed = BTreeSet::new();
+    for entry in fs::read_dir(bin_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        #[cfg(unix)]
+        {
+            if entry.file_type()?.is_symlink()
+                && let Ok(target) = fs::read_link(&path)
+                && target.to_string_lossy().starts_with("../current/node/bin/")
+                && !path.exists()
+            {
+                fs::remove_file(&path)?;
+                removed.insert(name);
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(stem) = name.strip_suffix(".cmd")
+                && !RESERVED_RUNTIME_BINS.contains(&stem)
+                && let Ok(content) = fs::read_to_string(&path)
+                && content.contains("..\\current\\node\\")
+                && !bin_dir.join("..").join("current").join("node").join(&name).exists()
+            {
+                fs::remove_file(&path)?;
+                removed.insert(name);
+            }
+        }
+    }
+
+    Ok(removed.into_iter().collect())
+}
+
 /// Links non-builtin binaries from a Node.js version into `~/.synapse/bin/`.
 pub fn link_node_global_bins(version_dir: &Path, bin_dir: &Path) -> Result<Vec<String>> {
+    let _ = cleanup_stale_node_global_bins(bin_dir);
+
     let src_bin_dir = if cfg!(windows) {
         version_dir.to_path_buf()
     } else {
@@ -192,7 +243,7 @@ pub fn link_node_global_bins(version_dir: &Path, bin_dir: &Path) -> Result<Vec<S
             None => continue,
         };
         let stem = name.strip_suffix(".cmd").or_else(|| name.strip_suffix(".exe")).unwrap_or(&name);
-        if name.starts_with('.') || BUILTIN_NODE_BINS.contains(&stem) {
+        if name.starts_with('.') || BUILTIN_NODE_BINS.contains(&stem) || RESERVED_RUNTIME_BINS.contains(&stem) {
             continue;
         }
         let file_type = entry.file_type()?;
@@ -219,6 +270,99 @@ pub fn link_node_global_bins(version_dir: &Path, bin_dir: &Path) -> Result<Vec<S
         }
 
         linked.insert(name);
+    }
+
+    Ok(linked.into_iter().collect())
+}
+
+/// Links non-reserved executables from `src_bin_dir` (e.g. `~/.bun/bin` or Composer `vendor/bin`) into `bin_dir`.
+pub fn link_external_global_bins(src_bin_dir: &Path, bin_dir: &Path) -> Result<Vec<String>> {
+    if bin_dir.is_dir() {
+        for entry in fs::read_dir(bin_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            #[cfg(unix)]
+            {
+                if entry.file_type()?.is_symlink()
+                    && let Ok(target) = fs::read_link(&path)
+                    && target.starts_with(src_bin_dir)
+                    && !path.exists()
+                {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+            #[cfg(windows)]
+            {
+                if let Some(name) = entry.file_name().to_str()
+                    && let Some(stem) = name.strip_suffix(".cmd")
+                    && !RESERVED_RUNTIME_BINS.contains(&stem)
+                    && let Ok(content) = fs::read_to_string(&path)
+                {
+                    let src_prefix = src_bin_dir.display().to_string();
+                    if content.contains(&src_prefix)
+                        && !src_bin_dir.join(stem).exists()
+                        && !src_bin_dir.join(format!("{}.exe", stem)).exists()
+                        && !src_bin_dir.join(format!("{}.cmd", stem)).exists()
+                        && !src_bin_dir.join(format!("{}.bat", stem)).exists()
+                    {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+
+    if !src_bin_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    fs::create_dir_all(bin_dir)?;
+    let mut linked = BTreeSet::new();
+
+    for entry in fs::read_dir(src_bin_dir)? {
+        let entry = entry?;
+        let name = match entry.file_name().to_str() {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        let stem = name
+            .strip_suffix(".cmd")
+            .or_else(|| name.strip_suffix(".bat"))
+            .or_else(|| name.strip_suffix(".exe"))
+            .unwrap_or(&name);
+        if name.starts_with('.') || RESERVED_RUNTIME_BINS.contains(&stem) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        let entry_path = entry.path();
+        if !entry_path.exists() {
+            continue;
+        }
+
+        #[cfg(unix)]
+        {
+            let link_path = bin_dir.join(&name);
+            switcher::atomic_symlink(&entry_path, &link_path)?;
+            linked.insert(name);
+        }
+
+        #[cfg(windows)]
+        {
+            if name.ends_with(".cmd") || name.ends_with(".bat") {
+                let shim_path = bin_dir.join(format!("{}.cmd", stem));
+                let content = format!("@echo off\r\ncall \"{}\" %*\r\n", entry_path.display());
+                fs::write(shim_path, content)?;
+                linked.insert(format!("{}.cmd", stem));
+            } else if name.ends_with(".exe") {
+                let shim_path = bin_dir.join(format!("{}.cmd", stem));
+                let content = format!("@echo off\r\n\"{}\" %*\r\n", entry_path.display());
+                fs::write(shim_path, content)?;
+                linked.insert(format!("{}.cmd", stem));
+            }
+        }
     }
 
     Ok(linked.into_iter().collect())
@@ -317,10 +461,26 @@ pub fn sync_globals(runtime: &str) -> Result<Vec<String>> {
 
     run_package_manager_install(runtime, &active_ver, &packages)?;
 
+    let bin_dir = paths::bin_dir()?;
     if runtime == "node" {
         let version_dir = paths::runtime_version_dir("node", &active_ver)?;
-        let bin_dir = paths::bin_dir()?;
         link_node_global_bins(&version_dir, &bin_dir)?;
+    } else if runtime == "bun"
+        && let Some(home) = dirs::home_dir()
+    {
+        let bun_bin = home.join(".bun").join("bin");
+        link_external_global_bins(&bun_bin, &bin_dir)?;
+    } else if runtime == "composer"
+        && let Some(home) = dirs::home_dir()
+    {
+        let xdg_bin = home.join(".config").join("composer").join("vendor").join("bin");
+        let legacy_bin = home.join(".composer").join("vendor").join("bin");
+        if xdg_bin.is_dir() || !legacy_bin.is_dir() {
+            link_external_global_bins(&xdg_bin, &bin_dir)?;
+        }
+        if legacy_bin.is_dir() {
+            link_external_global_bins(&legacy_bin, &bin_dir)?;
+        }
     }
 
     Ok(packages)
@@ -495,6 +655,80 @@ mod tests {
 
         let deps = discover_package_json_deps(&pkg_json).unwrap();
         assert_eq!(deps, vec!["@biomejs/biome", "prettier"]);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cleanup_stale_node_global_bins_removes_broken_links() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "synapse_stale_node_bins_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let current_bin = temp_dir.join("current").join("node").join("bin");
+        let synapse_bin = temp_dir.join("bin");
+        fs::create_dir_all(&current_bin).unwrap();
+        fs::create_dir_all(&synapse_bin).unwrap();
+
+        fs::write(current_bin.join("eslint"), "#!/bin/sh\n").unwrap();
+        fs::write(current_bin.join("pnpm"), "#!/bin/sh\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            switcher::atomic_symlink(
+                Path::new("../current/node/bin/eslint"),
+                &synapse_bin.join("eslint"),
+            )
+            .unwrap();
+            switcher::atomic_symlink(
+                Path::new("../current/node/bin/pnpm"),
+                &synapse_bin.join("pnpm"),
+            )
+            .unwrap();
+
+            // Remove pnpm target so the symlink becomes broken
+            fs::remove_file(current_bin.join("pnpm")).unwrap();
+
+            let removed = cleanup_stale_node_global_bins(&synapse_bin).unwrap();
+            assert_eq!(removed, vec!["pnpm"]);
+            assert!(!synapse_bin.join("pnpm").is_symlink());
+            assert!(synapse_bin.join("eslint").is_symlink());
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_link_external_global_bins_and_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "synapse_ext_bins_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        let ext_bin = temp_dir.join("ext_bin");
+        let synapse_bin = temp_dir.join("synapse_bin");
+        fs::create_dir_all(&ext_bin).unwrap();
+        fs::create_dir_all(&synapse_bin).unwrap();
+
+        #[cfg(unix)]
+        {
+            fs::write(ext_bin.join("laravel"), "#!/bin/sh\n").unwrap();
+            fs::write(ext_bin.join("php"), "#!/bin/sh\n").unwrap(); // reserved, must be skipped
+
+            let linked = link_external_global_bins(&ext_bin, &synapse_bin).unwrap();
+            assert_eq!(linked, vec!["laravel"]);
+            assert!(synapse_bin.join("laravel").is_symlink());
+            assert!(!synapse_bin.join("php").exists());
+
+            // Remove external binary and re-run to verify broken link cleanup
+            fs::remove_file(ext_bin.join("laravel")).unwrap();
+            let linked_after = link_external_global_bins(&ext_bin, &synapse_bin).unwrap();
+            assert!(linked_after.is_empty());
+            assert!(!synapse_bin.join("laravel").is_symlink());
+        }
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

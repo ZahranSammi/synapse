@@ -25,12 +25,12 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Install a specific runtime version
+    /// Install a runtime version (explicitly or from project version files in current directory)
     Install {
-        /// Runtime identifier ("node", "bun", "php", "composer", "postgres", "nginx")
-        runtime: String,
-        /// Target version (e.g. "22", "lts", "latest" for node; "17", "latest" for postgres; "stable", "latest" for nginx)
-        version: String,
+        /// Runtime identifier ("node", "bun", "php", "composer", "postgres", "nginx"); omit to install all pinned runtimes in current directory
+        runtime: Option<String>,
+        /// Target version (e.g. "22", "lts", "latest" for node; "17", "latest" for postgres; "stable", "latest" for nginx); omit to read from project version file
+        version: Option<String>,
         /// Do not switch to this version after installing
         #[arg(long)]
         no_use: bool,
@@ -90,6 +90,11 @@ pub enum Command {
     Env,
     /// Install the synapse binary into ~/.synapse/bin and configure shell PATH
     Setup,
+    /// Generate shell completion script for bash, zsh, fish, or powershell
+    Completions {
+        /// Target shell ("bash", "zsh", "fish", "powershell")
+        shell: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -160,7 +165,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             runtime,
             version,
             no_use,
-        } => handle_install(&runtime, &version, no_use).await,
+        } => handle_install(runtime.as_deref(), version.as_deref(), no_use).await,
         Command::Use { runtime, version } => {
             handle_use(runtime.as_deref(), version.as_deref()).await
         }
@@ -173,6 +178,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Service { action } => handle_service(action),
         Command::Env => handle_env(),
         Command::Setup => handle_setup(),
+        Command::Completions { shell } => handle_completions(&shell),
     }
 }
 
@@ -217,6 +223,12 @@ async fn install_runtime(
             provider.binary_names(),
             provider.bin_subdir(),
         )?;
+        if runtime == "node"
+            && let Ok(vdir) = paths::runtime_version_dir("node", version_name)
+            && let Ok(bdir) = paths::bin_dir()
+        {
+            let _ = crate::core::globals::link_node_global_bins(&vdir, &bdir);
+        }
         println!("{} Now using {} v{}", "✓".green().bold(), display, version_name);
         ensure_shell_path();
     }
@@ -378,7 +390,29 @@ async fn list_remote_runtime(
     Ok(())
 }
 
-async fn handle_install(runtime: &str, version: &str, no_use: bool) -> Result<()> {
+fn resolve_pinned_targets(
+    cwd: &std::path::Path,
+    runtime: Option<&str>,
+) -> Result<Vec<(String, String, std::path::PathBuf)>> {
+    match runtime {
+        Some(r) => {
+            let (pinned_ver, pin_path) = crate::core::version_file::find_pinned_version(cwd, r)?
+                .ok_or_else(|| SynapseError::PinNotFound(r.to_string()))?;
+            Ok(vec![(r.to_string(), pinned_ver, pin_path)])
+        }
+        None => {
+            let pins = crate::core::version_file::find_all_pinned_versions(cwd)?;
+            if pins.is_empty() {
+                return Err(SynapseError::PinNotFound(
+                    "any runtime (.node-version, .nvmrc, .bun-version, .php-version, .composer-version, .postgres-version, .nginx-version, .synapse-version)".to_string(),
+                ));
+            }
+            Ok(pins)
+        }
+    }
+}
+
+async fn install_runtime_by_name(runtime: &str, version: &str, no_use: bool) -> Result<()> {
     match runtime {
         "node" => install_runtime(&NodeProvider::new(), runtime, version, no_use).await,
         "bun" => install_runtime(&BunProvider::new(), runtime, version, no_use).await,
@@ -387,6 +421,31 @@ async fn handle_install(runtime: &str, version: &str, no_use: bool) -> Result<()
         "postgres" => install_runtime(&PostgresProvider::new(), runtime, version, no_use).await,
         "nginx" => install_runtime(&NginxProvider::new(), runtime, version, no_use).await,
         _ => Err(SynapseError::UnsupportedRuntime(runtime.to_string())),
+    }
+}
+
+async fn handle_install(
+    runtime: Option<&str>,
+    version: Option<&str>,
+    no_use: bool,
+) -> Result<()> {
+    match (runtime, version) {
+        (Some(r), Some(v)) => install_runtime_by_name(r, v, no_use).await,
+        (r, None) => {
+            let cwd = std::env::current_dir()?;
+            for (rt, pinned_ver, pin_path) in resolve_pinned_targets(&cwd, r)? {
+                println!(
+                    "{} Detected {} v{} in {}",
+                    "•".blue(),
+                    rt,
+                    pinned_ver,
+                    pin_path.display()
+                );
+                install_runtime_by_name(&rt, &pinned_ver, no_use).await?;
+            }
+            Ok(())
+        }
+        (None, Some(_)) => Err(SynapseError::UnsupportedRuntime(String::new())),
     }
 }
 
@@ -448,29 +507,11 @@ async fn handle_pin(runtime: &str, version: &str) -> Result<()> {
 }
 
 async fn handle_use(runtime: Option<&str>, version: Option<&str>) -> Result<()> {
-    let cwd = std::env::current_dir()?;
     match (runtime, version) {
         (Some(r), Some(v)) => switch_runtime_by_name(r, v).await,
-        (Some(r), None) => {
-            let (pinned_ver, pin_path) = crate::core::version_file::find_pinned_version(&cwd, r)?
-                .ok_or_else(|| SynapseError::PinNotFound(r.to_string()))?;
-            println!(
-                "{} Detected {} v{} in {}",
-                "•".blue(),
-                r,
-                pinned_ver,
-                pin_path.display()
-            );
-            switch_runtime_by_name(r, &pinned_ver).await
-        }
-        (None, None) => {
-            let pins = crate::core::version_file::find_all_pinned_versions(&cwd)?;
-            if pins.is_empty() {
-                return Err(SynapseError::PinNotFound(
-                    "any runtime (.node-version, .nvmrc, .bun-version, .php-version, .composer-version, .postgres-version, .nginx-version, .synapse-version)".to_string(),
-                ));
-            }
-            for (rt, pinned_ver, pin_path) in pins {
+        (r, None) => {
+            let cwd = std::env::current_dir()?;
+            for (rt, pinned_ver, pin_path) in resolve_pinned_targets(&cwd, r)? {
                 println!(
                     "{} Detected {} v{} in {}",
                     "•".blue(),
@@ -548,54 +589,9 @@ fn handle_current(runtime: Option<&str>) -> Result<()> {
 }
 
 fn handle_uninstall(runtime: &str, version: &str) -> Result<()> {
-    let bin_names: &[&str] = match runtime {
-        "node" => &["node", "npm", "npx"],
-        "bun" => &["bun", "bunx"],
-        "php" => &["php"],
-        "composer" => &["composer"],
-        "postgres" => &["postgres", "psql", "pg_ctl", "initdb", "pg_dump", "createdb", "dropdb"],
-        "nginx" => &["nginx"],
-        _ => return Err(SynapseError::UnsupportedRuntime(runtime.to_string())),
-    };
-
     let display = runtime_display_name(runtime);
-    let clean_version = version
-        .trim()
-        .strip_prefix("bun-v")
-        .or_else(|| version.trim().strip_prefix('v'))
-        .unwrap_or(version.trim());
-    let target_dir = paths::runtime_version_dir(runtime, clean_version)?;
-
-    if !target_dir.exists() {
-        return Err(SynapseError::NotInstalled(
-            runtime.to_string(),
-            clean_version.to_string(),
-        ));
-    }
-
-    // Check if uninstalled version is the active one
-    let current = crate::core::switcher::get_current_version(runtime)?;
-    if current.as_deref() == Some(clean_version) {
-        let current_symlink = paths::current_runtime_symlink(runtime)?;
-        if current_symlink.exists() || current_symlink.is_symlink() {
-            let _ = fs::remove_file(&current_symlink);
-            let _ = fs::remove_dir(&current_symlink);
-        }
-        if let Ok(cdir) = paths::current_dir() {
-            let _ = fs::remove_file(cdir.join(format!("{}.version", runtime)));
-        }
-        // Also remove shims if pointing to this runtime
-        let bin_dir = paths::bin_dir()?;
-        for bin_name in bin_names {
-            let bin_shim = bin_dir.join(bin_name);
-            if bin_shim.exists() || bin_shim.is_symlink() {
-                let _ = fs::remove_file(&bin_shim);
-            }
-            let cmd_shim = bin_dir.join(format!("{}.cmd", bin_name));
-            if cmd_shim.exists() {
-                let _ = fs::remove_file(&cmd_shim);
-            }
-        }
+    let (clean_version, was_active) = crate::core::switcher::uninstall_version(runtime, version)?;
+    if was_active {
         println!(
             "{} Removed active version symlinks for {} v{}",
             "•".yellow(),
@@ -603,8 +599,6 @@ fn handle_uninstall(runtime: &str, version: &str) -> Result<()> {
             clean_version
         );
     }
-
-    fs::remove_dir_all(&target_dir)?;
     println!(
         "{} Successfully uninstalled {} v{}",
         "✓".green().bold(),
@@ -813,6 +807,271 @@ fn handle_env() -> Result<()> {
     Ok(())
 }
 
+/// Generates a shell completion script for bash, zsh, fish, or powershell.
+pub fn generate_completions(shell: &str) -> Result<&'static str> {
+    match shell.trim().to_ascii_lowercase().as_str() {
+        "bash" => Ok(BASH_COMPLETIONS),
+        "zsh" => Ok(ZSH_COMPLETIONS),
+        "fish" => Ok(FISH_COMPLETIONS),
+        "powershell" | "pwsh" => Ok(POWERSHELL_COMPLETIONS),
+        _ => Err(SynapseError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "Unsupported shell '{}'. Supported shells: bash, zsh, fish, powershell",
+                shell
+            ),
+        ))),
+    }
+}
+
+fn handle_completions(shell: &str) -> Result<()> {
+    let script = generate_completions(shell)?;
+    print!("{}", script);
+    Ok(())
+}
+
+const BASH_COMPLETIONS: &str = r#"_synapse_completions() {
+    local cur prev cmd
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    local commands="install use pin list list-remote current uninstall globals service env setup completions"
+    local runtimes="node bun php composer postgres nginx"
+    local globals_runtimes="node bun composer"
+    local globals_actions="list add remove sync migrate"
+    local service_actions="start stop restart status logs"
+    local services="postgres nginx"
+    local shells="bash zsh fish powershell"
+
+    if [[ ${COMP_CWORD} -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "${commands}" -- "${cur}") )
+        return 0
+    fi
+
+    cmd="${COMP_WORDS[1]}"
+    case "${cmd}" in
+        install)
+            if [[ ${cur} == -* ]]; then
+                COMPREPLY=( $(compgen -W "--no-use --help" -- "${cur}") )
+            elif [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "${runtimes}" -- "${cur}") )
+            fi
+            ;;
+        use|pin|list|current|uninstall)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "${runtimes}" -- "${cur}") )
+            fi
+            ;;
+        list-remote)
+            if [[ ${cur} == -* ]]; then
+                COMPREPLY=( $(compgen -W "--limit -l --help" -- "${cur}") )
+            elif [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "${runtimes}" -- "${cur}") )
+            fi
+            ;;
+        globals)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "${globals_runtimes}" -- "${cur}") )
+            elif [[ ${COMP_CWORD} -eq 3 ]]; then
+                COMPREPLY=( $(compgen -W "${globals_actions}" -- "${cur}") )
+            fi
+            ;;
+        service)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "${service_actions}" -- "${cur}") )
+            elif [[ ${COMP_CWORD} -eq 3 ]]; then
+                if [[ "${COMP_WORDS[2]}" == "logs" && ${cur} == -* ]]; then
+                    COMPREPLY=( $(compgen -W "--lines -n --follow -f --help" -- "${cur}") )
+                else
+                    COMPREPLY=( $(compgen -W "${services}" -- "${cur}") )
+                fi
+            elif [[ "${COMP_WORDS[2]}" == "logs" && ${cur} == -* ]]; then
+                COMPREPLY=( $(compgen -W "--lines -n --follow -f --help" -- "${cur}") )
+            fi
+            ;;
+        completions)
+            if [[ ${COMP_CWORD} -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "${shells}" -- "${cur}") )
+            fi
+            ;;
+    esac
+}
+complete -F _synapse_completions synapse
+"#;
+
+const ZSH_COMPLETIONS: &str = r#"#compdef synapse
+
+_synapse() {
+    local -a commands runtimes globals_runtimes globals_actions service_actions services shells
+    commands=(
+        'install:Install a runtime version'
+        'use:Switch active version'
+        'pin:Pin a runtime version in the current directory'
+        'list:List locally installed versions'
+        'list-remote:List available remote versions'
+        'current:Show currently active runtime version'
+        'uninstall:Uninstall a specific runtime version'
+        'globals:Manage and sync global packages'
+        'service:Manage background services'
+        'env:Output export PATH configuration'
+        'setup:Install synapse binary and configure PATH'
+        'completions:Generate shell completion script'
+    )
+    runtimes=(node bun php composer postgres nginx)
+    globals_runtimes=(node bun composer)
+    globals_actions=(list add remove sync migrate)
+    service_actions=(start stop restart status logs)
+    services=(postgres nginx)
+    shells=(bash zsh fish powershell)
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+        return
+    fi
+
+    case "${words[2]}" in
+        install)
+            if (( CURRENT == 3 )); then
+                _describe 'runtime' runtimes
+            else
+                _arguments '--no-use[Do not switch to this version after installing]'
+            fi
+            ;;
+        use|pin|list|current|uninstall)
+            if (( CURRENT == 3 )); then
+                _describe 'runtime' runtimes
+            fi
+            ;;
+        list-remote)
+            if (( CURRENT == 3 )); then
+                _describe 'runtime' runtimes
+            else
+                _arguments '(-l --limit)'{-l,--limit}'[Maximum number of versions to display]:limit:'
+            fi
+            ;;
+        globals)
+            if (( CURRENT == 3 )); then
+                _describe 'runtime' globals_runtimes
+            elif (( CURRENT == 4 )); then
+                _describe 'action' globals_actions
+            fi
+            ;;
+        service)
+            if (( CURRENT == 3 )); then
+                _describe 'action' service_actions
+            elif (( CURRENT == 4 )); then
+                _describe 'service' services
+            elif [[ "${words[3]}" == "logs" ]]; then
+                _arguments \
+                    '(-n --lines)'{-n,--lines}'[Number of trailing lines to display]:lines:' \
+                    '(-f --follow)'{-f,--follow}'[Follow log output in real time]'
+            fi
+            ;;
+        completions)
+            if (( CURRENT == 3 )); then
+                _describe 'shell' shells
+            fi
+            ;;
+    esac
+}
+
+compdef _synapse synapse
+"#;
+
+const FISH_COMPLETIONS: &str = r#"complete -c synapse -f
+
+set -l __synapse_commands install use pin list list-remote current uninstall globals service env setup completions
+set -l __synapse_runtimes node bun php composer postgres nginx
+set -l __synapse_globals_runtimes node bun composer
+set -l __synapse_globals_actions list add remove sync migrate
+set -l __synapse_service_actions start stop restart status logs
+set -l __synapse_services postgres nginx
+set -l __synapse_shells bash zsh fish powershell
+
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a install -d "Install a runtime version"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a use -d "Switch active version"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a pin -d "Pin a runtime version"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a list -d "List locally installed versions"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a list-remote -d "List available remote versions"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a current -d "Show currently active runtime version"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a uninstall -d "Uninstall a runtime version"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a globals -d "Manage global packages"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a service -d "Manage background services"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a env -d "Output PATH setup command"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a setup -d "Install synapse binary and configure PATH"
+complete -c synapse -n "not __fish_seen_subcommand_from $__synapse_commands" -a completions -d "Generate shell completions"
+
+complete -c synapse -n "__fish_seen_subcommand_from install use pin list list-remote current uninstall; and not __fish_seen_subcommand_from $__synapse_runtimes" -a "$__synapse_runtimes"
+complete -c synapse -n "__fish_seen_subcommand_from install" -l no-use -d "Do not switch to this version after installing"
+complete -c synapse -n "__fish_seen_subcommand_from list-remote" -s l -l limit -d "Maximum number of versions to display"
+
+complete -c synapse -n "__fish_seen_subcommand_from globals; and not __fish_seen_subcommand_from $__synapse_globals_runtimes" -a "$__synapse_globals_runtimes"
+complete -c synapse -n "__fish_seen_subcommand_from globals; and __fish_seen_subcommand_from $__synapse_globals_runtimes; and not __fish_seen_subcommand_from $__synapse_globals_actions" -a "$__synapse_globals_actions"
+
+complete -c synapse -n "__fish_seen_subcommand_from service; and not __fish_seen_subcommand_from $__synapse_service_actions" -a "$__synapse_service_actions"
+complete -c synapse -n "__fish_seen_subcommand_from service; and __fish_seen_subcommand_from $__synapse_service_actions; and not __fish_seen_subcommand_from $__synapse_services" -a "$__synapse_services"
+complete -c synapse -n "__fish_seen_subcommand_from service; and __fish_seen_subcommand_from logs" -s n -l lines -d "Number of trailing lines to display"
+complete -c synapse -n "__fish_seen_subcommand_from service; and __fish_seen_subcommand_from logs" -s f -l follow -d "Follow log output in real time"
+
+complete -c synapse -n "__fish_seen_subcommand_from completions; and not __fish_seen_subcommand_from $__synapse_shells" -a "$__synapse_shells"
+"#;
+
+const POWERSHELL_COMPLETIONS: &str = r#"Register-ArgumentCompleter -Native -CommandName 'synapse' -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    $tokens = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
+    $commands = @('install', 'use', 'pin', 'list', 'list-remote', 'current', 'uninstall', 'globals', 'service', 'env', 'setup', 'completions')
+    $runtimes = @('node', 'bun', 'php', 'composer', 'postgres', 'nginx')
+    $globalsRuntimes = @('node', 'bun', 'composer')
+    $globalsActions = @('list', 'add', 'remove', 'sync', 'migrate')
+    $serviceActions = @('start', 'stop', 'restart', 'status', 'logs')
+    $services = @('postgres', 'nginx')
+    $shells = @('bash', 'zsh', 'fish', 'powershell')
+
+    $isCompletingNew = [string]::IsNullOrEmpty($wordToComplete)
+    $pos = if ($isCompletingNew) { $tokens.Count } else { $tokens.Count - 1 }
+
+    $candidates = @()
+    if ($pos -eq 1) {
+        $candidates = $commands
+    } elseif ($tokens.Count -ge 2) {
+        switch ($tokens[1]) {
+            'install' {
+                if ($wordToComplete -like '-*') { $candidates = @('--no-use', '--help') }
+                elseif ($pos -eq 2) { $candidates = $runtimes }
+            }
+            { $_ -in @('use', 'pin', 'list', 'current', 'uninstall') } {
+                if ($pos -eq 2) { $candidates = $runtimes }
+            }
+            'list-remote' {
+                if ($wordToComplete -like '-*') { $candidates = @('--limit', '-l', '--help') }
+                elseif ($pos -eq 2) { $candidates = $runtimes }
+            }
+            'globals' {
+                if ($pos -eq 2) { $candidates = $globalsRuntimes }
+                elseif ($pos -eq 3) { $candidates = $globalsActions }
+            }
+            'service' {
+                if ($pos -eq 2) { $candidates = $serviceActions }
+                elseif ($tokens.Count -ge 3 -and $tokens[2] -eq 'logs' -and $wordToComplete -like '-*') {
+                    $candidates = @('--lines', '-n', '--follow', '-f', '--help')
+                } elseif ($pos -eq 3) {
+                    $candidates = $services
+                }
+            }
+            'completions' {
+                if ($pos -eq 2) { $candidates = $shells }
+            }
+        }
+    }
+
+    $candidates | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+    }
+}
+"#;
+
 fn is_in_path(bin_dir: &std::path::Path) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|entry| entry == bin_dir))
@@ -873,6 +1132,7 @@ fn handle_setup() -> Result<()> {
     let current_exe = std::env::current_exe()?;
     let bin_dir = paths::bin_dir()?;
     let dest = install_self_to_dir(&current_exe, &bin_dir)?;
+    crate::core::switcher::refresh_shims_if_needed(&bin_dir)?;
     println!(
         "{} Installed synapse binary to {}",
         "✓".green().bold(),
@@ -906,8 +1166,9 @@ fn ensure_shell_path() {
     if !bin_dir.join(self_name).exists()
         && let Ok(exe) = std::env::current_exe()
         && exe.file_stem() == Some(std::ffi::OsStr::new("synapse"))
+        && install_self_to_dir(&exe, &bin_dir).is_ok()
     {
-        let _ = install_self_to_dir(&exe, &bin_dir);
+        let _ = crate::core::switcher::refresh_shims_if_needed(&bin_dir);
     }
 
     if is_in_path(&bin_dir) {
@@ -988,34 +1249,7 @@ fn ensure_shell_path() {
 }
 
 fn get_installed_versions(runtime: &str) -> Result<Vec<String>> {
-    let base = paths::runtime_dir(runtime)?;
-    if !base.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut versions = Vec::new();
-    for entry in fs::read_dir(base)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            if let Some(name) = entry.file_name().to_str() {
-                if !name.starts_with('.') {
-                    versions.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    // Sort descending by semver if possible
-    versions.sort_by(|a, b| {
-        let sa = semver::Version::parse(a);
-        let sb = semver::Version::parse(b);
-        match (sa, sb) {
-            (Ok(va), Ok(vb)) => vb.cmp(&va),
-            _ => b.cmp(a),
-        }
-    });
-
-    Ok(versions)
+    crate::core::switcher::list_installed_versions(runtime)
 }
 
 #[cfg(test)]
@@ -1050,6 +1284,64 @@ mod tests {
         let dest_again = install_self_to_dir(&dest, &bin_dir).unwrap();
         assert_eq!(dest_again, dest);
         assert_eq!(fs::read(&dest_again).unwrap(), b"fake synapse binary");
+
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn test_generate_completions_for_supported_shells() {
+        let bash = generate_completions("bash").unwrap();
+        assert!(bash.contains("complete -F _synapse_completions synapse"));
+        assert!(bash.contains("completions"));
+
+        let zsh = generate_completions("ZSH").unwrap();
+        assert!(zsh.contains("#compdef synapse"));
+        assert!(zsh.contains("_synapse"));
+
+        let fish = generate_completions("fish").unwrap();
+        assert!(fish.contains("complete -c synapse"));
+
+        let ps = generate_completions("powershell").unwrap();
+        assert!(ps.contains("Register-ArgumentCompleter"));
+        assert_eq!(generate_completions("pwsh").unwrap(), ps);
+
+        let err = generate_completions("tcsh").unwrap_err();
+        assert!(matches!(err, SynapseError::Io(_)));
+    }
+
+    #[test]
+    fn test_resolve_pinned_targets() {
+        let temp_root =
+            std::env::temp_dir().join(format!("synapse_pinned_targets_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_root);
+        fs::create_dir_all(&temp_root).unwrap();
+
+        // Empty dir -> PinNotFound
+        let err = resolve_pinned_targets(&temp_root, None).unwrap_err();
+        assert!(matches!(err, SynapseError::PinNotFound(_)));
+
+        // Unsupported runtime -> UnsupportedRuntime
+        let rt_err = resolve_pinned_targets(&temp_root, Some("ruby")).unwrap_err();
+        assert!(matches!(rt_err, SynapseError::UnsupportedRuntime(_)));
+
+        // .synapse-version with multiple runtimes
+        let synapse_file = temp_root.join(".synapse-version");
+        fs::write(&synapse_file, "node = \"22.11.0\"\nbun = \"1.4.2\"\n").unwrap();
+
+        let single = resolve_pinned_targets(&temp_root, Some("node")).unwrap();
+        assert_eq!(
+            single,
+            vec![("node".to_string(), "22.11.0".to_string(), synapse_file.clone())]
+        );
+
+        let all = resolve_pinned_targets(&temp_root, None).unwrap();
+        assert_eq!(
+            all,
+            vec![
+                ("node".to_string(), "22.11.0".to_string(), synapse_file.clone()),
+                ("bun".to_string(), "1.4.2".to_string(), synapse_file),
+            ]
+        );
 
         let _ = fs::remove_dir_all(&temp_root);
     }

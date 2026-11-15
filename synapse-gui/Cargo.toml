@@ -1,0 +1,9 @@
+[package]
+name = "synapse-gui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui = "0.2.2"
+synapse = { path = ".." }
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }

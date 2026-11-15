@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "synapse-gui"]
+resolver = "2"
+
 [package]
 name = "synapse"
 version = "0.1.0"
