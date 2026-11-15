@@ -6,9 +6,11 @@ Universal Runtime Version Manager written in Rust for **Node.js** (with bundled 
 
 - **Unified CLI** for managing `node`, `bun`, `php`, `composer`, `postgres`, and `nginx` from a single binary.
 - **Managed Local Services** (`synapse service`) with automatic `PGDATA` cluster initialization (`initdb` + `pg_ctl`) for PostgreSQL and standalone user-space configuration for Nginx (`nginx.conf` on port `8080`).
-- **Native Switching** via atomic POSIX symlinks on Linux and directory junctions + `.cmd` shims on Windows.
-- **Per-Project Pinning** supporting `.node-version`, `.nvmrc`, `.bun-version`, `.php-version`, `.composer-version`, `.postgres-version`, `.nginx-version`, and multi-runtime `.synapse-version`.
-- **Global Packages Management** (`synapse globals`) with manifest tracking (`packages.txt`), automatic discovery, cross-version migration, and automatic Node global binary shimming.
+- **Native Switching** via atomic POSIX symlinks and smart multicall shims on Linux, plus directory junctions + `.cmd` shims on Windows.
+- **Per-Project Pinning** supporting `.node-version`, `.nvmrc`, `.bun-version`, `.php-version`, `.composer-version`, `.postgres-version`, `.nginx-version`, and multi-runtime `.synapse-version`, with automatic per-directory shim resolution on Linux and one-command `synapse install` from pin files.
+- **Global Packages Management** (`synapse globals`) with manifest tracking (`packages.txt`), automatic discovery, cross-version migration, and automatic binary shimming (`node`, `bun`, `composer`) with stale symlink cleanup.
+- **Shell Completions** (`synapse completions`) for `bash`, `zsh`, `fish`, and `powershell`.
+- **Desktop GUI (`synapse-gui`)** built with GPUI featuring **Dark** and **Light** themes for managing runtimes, background services & logs, global packages, and project pins.
 - **Security Hardening** with fail-closed SHA-256 checksum verification (`node`, `bun`, `composer`, `postgres`), path traversal validation, zip-slip / tar symlink escape protection, and bounded download buffers.
 
 ## Build & Setup
@@ -54,6 +56,10 @@ synapse install nginx stable
 
 # Install without changing the active global version
 synapse install node 20 --no-use
+
+# Install runtime(s) pinned in the current or parent directory
+synapse install node
+synapse install
 ```
 
 ### Switch, List & Uninstall
@@ -70,8 +76,9 @@ synapse list node
 synapse current
 synapse current node
 
-# Remove an installed version
+# Remove an installed version (supports exact or partial version)
 synapse uninstall node 20.18.0
+synapse uninstall node 20
 ```
 
 ### Per-Project Version Pinning
@@ -81,12 +88,31 @@ synapse uninstall node 20.18.0
 synapse pin node 22
 synapse pin bun latest
 
-# Switch to the pinned version detected in current or parent directories
+# Install or switch to the pinned version detected in current or parent directories
+synapse install
 synapse use node
 synapse use
 ```
 
+On Linux, shims installed in `~/.synapse/bin` automatically resolve the pinned version for your current working directory (without modifying the global active version) and fall back to the global `current` version when no pin file is present.
+
 Supported pin files: `.synapse-version` (TOML or `runtime = version` lines), `.node-version`, `.nvmrc`, `.bun-version`, `.php-version`, `.composer-version`, `.postgres-version`, and `.nginx-version`.
+
+### Shell Completions
+
+```bash
+# Bash (~/.bashrc)
+eval "$(synapse completions bash)"
+
+# Zsh (~/.zshrc)
+eval "$(synapse completions zsh)"
+
+# Fish (~/.config/fish/completions/synapse.fish)
+synapse completions fish > ~/.config/fish/completions/synapse.fish
+
+# PowerShell ($PROFILE)
+synapse completions powershell | Out-String | Invoke-Expression
+```
 
 ### Managed Services (PostgreSQL & Nginx)
 
@@ -127,6 +153,22 @@ synapse globals node migrate 20 22
 
 Supported runtimes for `globals`: `node`, `bun`, and `composer`.
 
+## Desktop GUI (GPUI)
+
+The `synapse-gui` workspace crate provides a GPU-accelerated desktop interface powered by GPUI (`gpui`), keeping the core `synapse` CLI/shim binary lightweight:
+
+```bash
+# Run in development
+cargo run -p synapse-gui
+
+# Or build release binary
+cargo build --release -p synapse-gui
+./target/release/synapse-gui
+```
+
+- **Tabs**: **Runtimes** (install/switch/uninstall & fetch remote versions), **Services** (PostgreSQL/Nginx start/stop/restart & log tail viewer), **Globals** (add/remove/sync/migrate tracked packages), and **Project Pins** (`.synapse-version`, `.node-version`, etc.).
+- **Themes**: Toggle between **Dark** and **Light** mode from the sidebar; preference is persisted in `~/.synapse/gui-theme`.
+
 ## Directory Layout
 
 ```text
@@ -135,7 +177,8 @@ Supported runtimes for `globals`: `node`, `bun`, and `composer`.
 ├── current/      # Links to the currently active runtime version directories
 ├── runtimes/     # Installed runtime versions (<runtime>/<version>/)
 ├── globals/      # Tracked global package manifests (<runtime>/packages.txt)
-└── data/         # Managed service data/configs (postgres/<version>/data, nginx/)
+├── data/         # Managed service data/configs (postgres/<version>/data, nginx/)
+└── gui-theme     # Persisted GPUI desktop theme preference (dark | light)
 ```
 
 ## Security & Integrity
